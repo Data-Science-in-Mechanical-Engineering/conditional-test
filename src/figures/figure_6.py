@@ -116,10 +116,9 @@ def main():
     ax.set_xlabel(r"Time")
     ax.set_ylabel(r"Max. ratio")
 
-    plt.tight_layout(pad=0.25, rect=(0, -0.02, 1, 1.04))
+    plt.tight_layout(pad=0.25, rect=(0, 0, 1, 1.04))
 
     plt.savefig(DIR_FIGURES / "monitoring.pdf", format="pdf")
-    # plt.show()
 
 
 if __name__ == "__main__":
