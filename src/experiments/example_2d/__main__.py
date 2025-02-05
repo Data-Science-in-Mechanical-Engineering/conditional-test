@@ -6,7 +6,7 @@ from src.config import BootstrapThresholdConfig
 from src.data import RKHSFnSampling
 from src.experiments.example_2d.spec import Config, DEFAULT_CONFIG, Result
 from src.random import generate_random_keys
-from src.util import KernelParametrization, DIR_RESULTS
+from src.util import KernelParametrization, DIR_RESULTS, move_experiment_run
 
 
 def _compute_rejection_region(
@@ -72,4 +72,10 @@ def main(config: Config):
 
 
 if __name__ == "__main__":
-    main(DEFAULT_CONFIG)
+    run = main(DEFAULT_CONFIG)
+
+    move_experiment_run(
+        run=run,
+        sub_dir=None,
+        dir_name="res-1"
+    )

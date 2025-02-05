@@ -7,7 +7,7 @@ from src.experiments.example_1d.plots import plot_analytical, plot_bootstrap
 from src.experiments.example_1d.spec import Config, DEFAULT_CONFIG, Result
 from src.figures.util import set_plot_style
 from src.random import generate_random_keys
-from src.util import DIR_RESULTS
+from src.util import DIR_RESULTS, move_experiment_run
 
 
 @expyro.plot(plot_analytical, file_format="png")
@@ -77,4 +77,11 @@ def main(config: Config):
 
 if __name__ == "__main__":
     set_plot_style()
-    main(DEFAULT_CONFIG)
+
+    run = main(DEFAULT_CONFIG)
+
+    move_experiment_run(
+        run=run,
+        sub_dir=None,
+        dir_name="res-1"
+    )
