@@ -1,114 +1,160 @@
-from functools import partial
+from typing import NamedTuple, Self
 
 import jax
 import jax.numpy as jnp
+import tqdm
+import tyro
+from jax import Array
 
 from src import expyro
-from src.bounds import bootstrap_cmmd_thresholds
-from src.data import RKHSFnSampling
-from src.experiments.monitoring.spec import Config, Result, DEFAULT_ARGS
-from src.figures.util import set_plot_style
-from src.random import generate_random_keys
-from src.util import KernelParametrization, move_experiment_run, DIR_RESULTS
+from src.experiments.monitoring.plots import plot_thresholds, plot_cmmd, plot_ratio, plot_beta, \
+    plot_online_trajectories, plot_posterior_std
+from src.experiments.monitoring.spec import MultipleResult, Config, DEFAULT_ARGS, SingleResult
+from src.rkhs import VectorKernel
+from src.rkhs.testing import BootstrapConditionalTestEmbedding, two_sample_test, TestOutcome
+from src.util import generate_random_keys, move_experiment_run, DIR_RESULTS, set_plot_style
+
+PLOTS = [plot_ratio, plot_thresholds, plot_cmmd, plot_beta, plot_posterior_std, plot_online_trajectories]
 
 
-def monitor(
-        kernel: KernelParametrization,
-        dataset_reference: RKHSFnSampling,
-        trajectory: RKHSFnSampling,
-        window_size: int, n_evaluations: int,
-        n_bootstrap: int, confidence_level: float,
-        key: jax.Array
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    length_trajectory = trajectory.xs.shape[0]
+def make_windows(trajectory: Array, window_size: int) -> tuple[Array, Array, Array]:
+    assert trajectory.ndim == 2
+    assert window_size >= 1
+
+    xs = trajectory[:-1]
+    ys = trajectory[1:]
+
+    length_trajectory = trajectory.shape[0] - 1
     window_indices = jnp.arange(window_size) + jnp.arange(length_trajectory - window_size + 1)[:, None]
 
-    xs_windows = trajectory.xs[window_indices]
-    ys_windows = trajectory.ys[window_indices]
-    es_windows = xs_windows[:, -n_evaluations:]
+    xs_windows = xs[window_indices]
+    ys_windows = ys[window_indices]
 
-    ckme_reference = kernel.x.ckme(dataset_reference.xs, dataset_reference.ys, kernel.regularization)
+    return xs_windows, ys_windows, xs_windows
 
-    @partial(jax.vmap)
-    def step(xs: jnp.ndarray, ys: jnp.ndarray, es: jnp.ndarray, key_: jax.Array) -> tuple[jnp.ndarray, jnp.ndarray]:
-        ckme_window = kernel.x.ckme(xs, ys, kernel.regularization)
-        kmes_window = kernel.x.condition.one_many(ckme_window, es)
-        kmes_reference = kernel.x.condition.one_many(ckme_reference, es)
 
-        cmmds = kernel.y.distance.batch(kmes_window, kmes_reference)
+class Monitoring(NamedTuple):
+    outcomes: TestOutcome
+    betas: Array
+    posterior_std_reference: Array
+    posterior_std_windows: Array
 
-        thresholds = bootstrap_cmmd_thresholds(
-            kernel_x=kernel.x, kernel_y=kernel.y,
-            ckme_1=ckme_reference, ckme_2=ckme_window,
-            es_1=es, es_2=es,
-            n_bootstrap=n_bootstrap, power=confidence_level,
-            single_beta=True,
-            key=key_
+    @classmethod
+    def from_stream(
+            cls,
+            kernel_reference: VectorKernel, kernel_windows: VectorKernel,
+            reference_dataset: Array, trajectory: Array,
+            window_size: int, n_bootstrap: int, significance_level: float,
+            key: Array
+    ) -> Self:
+        xs_reference = reference_dataset[:-1]
+        ys_reference = reference_dataset[1:]
+
+        key, key_cme_reference = jax.random.split(key)
+
+        cme_reference = BootstrapConditionalTestEmbedding.from_data(
+            kernel=kernel_reference, xs=xs_reference, ys=ys_reference, es=xs_reference,
+            n_bootstrap=n_bootstrap, key=key_cme_reference
         )
 
-        return cmmds, thresholds
+        xs_windows, ys_windows, es_windows = make_windows(trajectory, window_size)
 
-    keys = jax.random.split(key, length_trajectory - window_size + 1)
-    return step(xs_windows, ys_windows, es_windows, keys)
+        def step(xs_window: Array, ys_window: Array, es_window: Array, key_window: Array) -> Monitoring:
+            cme = BootstrapConditionalTestEmbedding.from_data(
+                kernel_windows, xs_window, ys_window, xs_reference,
+                n_bootstrap=n_bootstrap, key=key_window,
+            )
+
+            kmes_reference = cme_reference(es_window)
+            kmes_window = cme(es_window)
+
+            beta = kmes_window.beta(significance_level)
+            posterior_std_reference = cme_reference.posterior_std(es_window)
+            posterior_std_windows = cme.posterior_std(es_window)
+            outcome = two_sample_test(kmes_reference, kmes_window, significance_level=significance_level)
+
+            return Monitoring(
+                outcomes=outcome,
+                betas=beta,
+                posterior_std_reference=posterior_std_reference,
+                posterior_std_windows=posterior_std_windows,
+            )
+
+        n_steps = xs_windows.shape[0]
+        keys = jax.random.split(key, n_steps)
+
+        return jax.lax.map(
+            f=lambda inp: step(*inp),
+            xs=(xs_windows, ys_windows, es_windows, keys)
+        )
 
 
-@expyro.experiment(DIR_RESULTS, "monitoring")
-def main(config: Config):
+@expyro.plot(*PLOTS, file_format="png")
+@expyro.experiment(DIR_RESULTS, name="monitoring")
+def experiment(config: Config) -> MultipleResult:
     rng = generate_random_keys(config.seed)
 
-    kernel = config.kernel.make()
+    kernel_reference, kernel_windows = config.vector_kernels()
 
-    true_fn = config.sample_true_fn(kernel.x, next(rng))
-    disturbance_fn = config.sample_disturbance_fn(kernel.x, next(rng))
-    disturbed_fn = true_fn + disturbance_fn
+    dynamics = config.sample_dynamics(next(rng))
+    dynamics_disturbed = config.disturb_dynamics(dynamics, next(rng))
 
-    dataset_reference = config.sample_reference_dataset(kernel.x, true_fn, next(rng))
+    runs = []
 
-    nominal_trajectory = config.sample_trajectory(
-        kernel=kernel.x,
-        fn=true_fn,
-        x_init=jnp.array([2.5, 2.5]),
-        length=5 * config.size_window,
-        key=next(rng)
+    for _ in tqdm.trange(config.n_repetitions):
+        reference_dataset = config.sample_reference_dataset(dynamics=dynamics, key=next(rng))
+        online_trajectory = config.sample_online_trajectory(dynamics, dynamics_disturbed, next(rng))
+
+        monitoring = Monitoring.from_stream(
+            kernel_reference=kernel_reference, kernel_windows=kernel_windows,
+            reference_dataset=reference_dataset,
+            trajectory=online_trajectory,
+            window_size=config.window_size, n_bootstrap=config.test.n_bootstrap,
+            significance_level=config.test.significance_level, key=next(rng)
+        )
+
+        run = SingleResult(
+            outcomes=monitoring.outcomes,
+            reference_dataset=reference_dataset,
+            online_trajectory=online_trajectory,
+            beta=monitoring.betas,
+            posterior_std_reference=monitoring.posterior_std_reference,
+            posterior_std_windows=monitoring.posterior_std_windows
+        )
+
+        runs.append(run)
+
+    return MultipleResult(
+        runs=runs,
+        dynamics=dynamics,
+        dynamics_disturbed=dynamics_disturbed
     )
 
-    anomalous_trajectory = config.sample_trajectory(
-        kernel=kernel.x,
-        fn=disturbed_fn,
-        x_init=nominal_trajectory.xs[-1],
-        length=5 * config.size_window,
-        key=next(rng)
+
+def main(dimension: int, disturbance: float, seed: int):
+    config = Config(
+        **DEFAULT_ARGS,
+        seed=seed,
+        dim=dimension,
+        disturbance=disturbance
     )
 
-    trajectory = RKHSFnSampling(
-        xs=jnp.concatenate([nominal_trajectory.xs, anomalous_trajectory.xs]),
-        ys=jnp.concatenate([nominal_trajectory.ys, anomalous_trajectory.ys])
-    )
+    sub_dir = f"d={dimension}__disturbance={disturbance}"
+    run_name = f"seed={seed}"
 
-    cmmd_windows, threshold_windows = monitor(
-        kernel=kernel,
-        dataset_reference=dataset_reference,
-        trajectory=trajectory,
-        window_size=config.size_window,
-        n_evaluations=config.n_evaluations,
-        n_bootstrap=config.n_bootstrap, confidence_level=config.confidence_level,
-        key=next(rng)
-    )
+    if (experiment.directory / experiment.name / sub_dir / run_name).exists():
+        print(f"Skipping {sub_dir}/{run_name} because it already exists.")
+        return
 
-    return Result(cmmd_windows=cmmd_windows, threshold_windows=threshold_windows)
+    run = experiment(config)
+
+    move_experiment_run(
+        run=run,
+        sub_dir=sub_dir,
+        dir_name=run_name
+    )
 
 
 if __name__ == "__main__":
     set_plot_style()
-
-    for disturbance in [0.25, 0.5, 0.75, 1]:
-        run = main(Config(
-            **DEFAULT_ARGS,
-            disturbance=disturbance
-        ))
-
-        move_experiment_run(
-            run,
-            sub_dir=None,
-            dir_name=f"disturbance-{disturbance}",
-        )
+    tyro.cli(main)

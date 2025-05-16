@@ -1,42 +1,43 @@
 import seaborn as sns
-from jax import numpy as jnp
+from jax import Array, numpy as jnp
 from matplotlib import pyplot as plt
-from matplotlib.gridspec import GridSpec
 
-from src.experiments.error_rates.spec import PositiveRate, BaseConfig
+from src.experiments.error_rates.spec import Config
+from src.util import COLOR_GRID
 
 
-def plot_positive_rates(config: BaseConfig, rates: PositiveRate) -> plt.Figure:
-    fig = plt.figure(figsize=(10, 5))
-    grid = GridSpec(figure=fig, nrows=1, ncols=2)
+def plot_positive_rate(config: Config, positive_rates: Array) -> plt.Figure:
+    significance_levels = config.significance_levels
 
-    ax_uniform = fig.add_subplot(grid[0, 0])
-    ax_local = fig.add_subplot(grid[0, 1], sharex=ax_uniform, sharey=ax_uniform)
+    assert significance_levels.ndim == 1
+    assert positive_rates.ndim == 2
+    assert len(significance_levels) == positive_rates.shape[1]
 
-    ax_uniform.set_xlabel(r"$\alpha$")
-    ax_local.set_xlabel(r"$\alpha$")
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
 
-    ax_uniform.set_title("Space-uniform positive rate")
-    ax_local.set_title("Space-local positive rate")
-
-    confidence_levels = config.confidence_levels()
+    mean = positive_rates.mean(axis=0)
 
     sns.lineplot(
-        x=confidence_levels, y=rates.uniform,
-        ax=ax_uniform,
-        linewidth=3,
-        estimator=None
+        x=significance_levels, y=mean,
+        linewidth=2,
+        ax=ax
     )
+
+    identity = jnp.linspace(0, 1, 1000)
 
     sns.lineplot(
-        x=confidence_levels, y=rates.local,
-        ax=ax_local,
-        linewidth=3,
-        estimator=None
+        x=identity, y=identity,
+        color=COLOR_GRID, linestyle="-", linewidth=0.5,
+        ax=ax
     )
 
-    ax_uniform.set_ylim(-0.025, 1.025)
+    ax.set_xmargin(0.02)
+    ax.set_ymargin(0.02)
 
-    plt.tight_layout(pad=1)
+    ax.set_xlabel(r"Significance level $\alpha$")
+    fig.suptitle("Positive rate")
+
+    plt.tight_layout()
 
     return fig

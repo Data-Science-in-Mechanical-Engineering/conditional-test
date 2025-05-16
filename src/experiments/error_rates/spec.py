@@ -1,250 +1,248 @@
-from abc import abstractmethod, ABC
+from abc import abstractmethod
 from dataclasses import dataclass
-from functools import partial
-from typing import NamedTuple
+from typing import NamedTuple, Self, Iterator
 
 import jax
-from jax import numpy as jnp
+import jax.numpy as jnp
+from jax import Array
 
-from src.config import ThresholdConfig, DataConfig, IIDDataConfig, SpaceConfig, GaussianMixtureNoiseConfig, \
-    KernelParametrizationConfig, BootstrapThresholdConfig
 from src.data import RKHSFnSampling
-from src.random import uniform_rkhs_subspace_fn, uniform_rkhs_subspace_fns
-from src.rkhs import Kernel, RKHSFn
+from src.experiments.error_rates.tests import BootstrapTest, AnalyticalTest, HuLeiTest
+from src.rkhs import RKHSFn, Kernel, GaussianKernel
+from src.spec import NoiseSpec, VectorKernelSpec, RKHSFnSpec, SpaceSpec
+
+
+# rejection sampling algorithm for sampling uniformly from a hypercube without a centered ball
+def _sample_uniform_without_ball(space: SpaceSpec, radius: float, shape: tuple[int, ...], key: Array) -> Array:
+    assert (2 * radius <= space.max_vector - space.min_vector).all()
+    center = (space.max_vector - space.min_vector) / 2 + space.min_vector
+
+    def get_violations(points: Array) -> Array:
+        return jnp.linalg.norm(points - center, axis=-1, keepdims=True) <= radius
+
+    key, key_sample = jax.random.split(key)
+    sample = space.uniform_sample(shape=shape, key=key)
+    violations = get_violations(sample)
+
+    while violations.any():
+        key, key_sample = jax.random.split(key)
+        corrections = space.uniform_sample(shape=shape, key=key)
+        sample = jnp.where(violations, corrections, sample)
+        violations = get_violations(sample)
+
+    return sample
+
+
+# sample uniformly from a hyperball with a specified radius
+def _sample_uniform_ball(radius: float, dim: int, shape: tuple[int, ...], key: Array) -> Array:
+    direction = jax.random.normal(key, shape=shape + (dim,))
+    scaling = jax.random.uniform(key, shape=shape + (1,)) ** (1 / dim)
+    return direction / jnp.linalg.norm(direction, axis=-1, keepdims=True) * radius * scaling
+
+
+class RKHSFnSamplingPair(NamedTuple):
+    fn_1: RKHSFn
+    fn_2: RKHSFn
+    dataset_1: RKHSFnSampling
+    dataset_2: RKHSFnSampling
+
+    @classmethod
+    def sample(
+            cls,
+            fn_1: RKHSFn, fn_2: RKHSFn,
+            noise_1: NoiseSpec, noise_2: NoiseSpec,
+            space: SpaceSpec,
+            dataset_size: int, n_datasets: int,
+            key: Array
+    ) -> Self:
+        key, key_xs_1, key_xs_2 = jax.random.split(key, 3)
+        xs_1 = space.uniform_sample(shape=(n_datasets, dataset_size), key=key_xs_1)
+        xs_2 = space.uniform_sample(shape=(n_datasets, dataset_size), key=key_xs_2)
+        return cls.sample_at(fn_1, fn_2, xs_1, xs_2, noise_1, noise_2, key)
+
+    @classmethod
+    def sample_at(
+            cls,
+            fn_1: RKHSFn, fn_2: RKHSFn,
+            xs_1: Array, xs_2: Array,
+            noise_1: NoiseSpec, noise_2: NoiseSpec,
+            key: Array
+    ) -> Self:
+        sampling_1 = RKHSFnSampling.at_points(fn_1, xs_1)
+        sampling_2 = RKHSFnSampling.at_points(fn_2, xs_2)
+
+        key_noise_1, key_noise_2 = jax.random.split(key)
+
+        noise_1 = noise_1.sample(sampling_1.ys.shape, key_noise_1)
+        noise_2 = noise_2.sample(sampling_2.ys.shape, key_noise_2)
+
+        noisy_sampling_1 = sampling_1.add_y(noise_1)
+        noisy_sampling_2 = sampling_2.add_y(noise_2)
+
+        return RKHSFnSamplingPair(fn_1, fn_2, noisy_sampling_1, noisy_sampling_2)
+
+    def __len__(self) -> int:
+        assert len(self.dataset_1) == len(self.dataset_2)
+        return len(self.dataset_1)
+
+    def __getitem__(self, item) -> Self:
+        return RKHSFnSamplingPair(self.fn_1, self.fn_2, self.dataset_1[item], self.dataset_2[item])
+
+    def __iter__(self) -> Iterator[Self]:
+        for i in range(len(self)):
+            yield self[i]
 
 
 @dataclass(frozen=True)
-class BaseConfig(ABC):
-    kernel: KernelParametrizationConfig  # configuration of the kernel
-    threshold: ThresholdConfig  # configuration for the computation of the decision threshold on the CMMD
-    data: DataConfig  # configuration for the dataset
-    n_functions: int  # number of RKHS functions to average over
-    n_basis_points: int  # number of points on which each function is centered
-    n_datasets: int  # number of datasets to sample for each function
-    n_evaluation_points: int  # number of points at which the CMMD is evaluated
-    rkhs_ball_radius: float  # radius of the RKHS ball from which the functions are sampled
-    resolution_power: int  # power of the resolution grid
-    n_bootstrap_rate: int  # number of bootstrap samples to bootstrap the distribution *of the rejection rates*
-    seed: int  # random seed
+class _DatasetPairSamplingSpec:
+    rkhs_fn: RKHSFnSpec
+    noise_1: NoiseSpec
+    noise_2: NoiseSpec
+    dataset_size: int
 
     def __post_init__(self):
-        assert self.n_basis_points >= 1
-        assert self.n_datasets >= 1
-        assert self.rkhs_ball_radius > 0
-        assert self.resolution_power >= 1
-
-    def confidence_levels(self) -> jnp.ndarray:
-        return jnp.linspace(0, self.threshold.confidence_level, self.resolution_power + 1)[1:]
+        assert self.dataset_size >= 1
 
     @abstractmethod
-    def sample_rkhs_fn_pair(self, kernel: Kernel, key: jax.Array) -> tuple[RKHSFn, RKHSFn]:
+    def sample(self, kernel: Kernel, space: SpaceSpec, n_datasets: int, key: Array) -> RKHSFnSamplingPair:
         raise NotImplementedError
 
-    @abstractmethod
-    def sample_dataset_pair(
-            self,
-            kernel: Kernel,
-            fn_1: RKHSFn, fn_2: RKHSFn,
-            key: jax.Array
-    ) -> tuple[RKHSFnSampling, RKHSFnSampling]:
-        raise NotImplementedError
 
-    @abstractmethod
-    def sub_gaussian_std(self) -> float:
-        raise NotImplementedError
+@dataclass(frozen=True)
+class DatasetPairSamplingSpec(_DatasetPairSamplingSpec):
+    single_fn: bool
 
-    def sample_rkhs_fn(
-            self,
-            kernel: Kernel,
-            key: jax.Array,
-            radius: float | None = None,
-            sphere: bool = False
-    ) -> RKHSFn:
-        if radius is None:
-            radius = self.rkhs_ball_radius
+    def sample(self, kernel: Kernel, space: SpaceSpec, n_datasets: int, key: Array) -> RKHSFnSamplingPair:
+        key, key_fn_1, key_fn_2 = jax.random.split(key, 3)
+        rkhs_fn_1 = self.rkhs_fn.sample(kernel, space, key=key_fn_1, surface=True)
 
-        key_1, key_2 = jax.random.split(key)
+        if self.single_fn:
+            rkhs_fn_2 = rkhs_fn_1
+        else:
+            rkhs_fn_2 = self.rkhs_fn.sample(kernel, space, key=key_fn_2, surface=True)
 
-        return uniform_rkhs_subspace_fns(
+        return RKHSFnSamplingPair.sample(
+            fn_1=rkhs_fn_1, fn_2=rkhs_fn_2,
+            noise_1=self.noise_1, noise_2=self.noise_2,
+            space=space,
+            dataset_size=self.dataset_size, n_datasets=n_datasets,
+            key=key
+        )
+
+
+@dataclass(frozen=True)
+class DisturbedDatasetPairSamplingSpec(_DatasetPairSamplingSpec):
+    n_disturbance_basis_point: int
+    relative_disturbance_norm: float
+
+    @property
+    def disturbance_norm(self) -> float:
+        return self.rkhs_fn.ball_radius * self.relative_disturbance_norm
+
+    def __post_init__(self):
+        super().__post_init__()
+        assert self.n_disturbance_basis_point >= 1
+
+    @property
+    def disturbance_rkhs_fn(self) -> RKHSFnSpec:
+        return RKHSFnSpec(n_basis_points=self.n_disturbance_basis_point, ball_radius=self.disturbance_norm)
+
+    def sample(self, kernel: Kernel, space: SpaceSpec, n_datasets: int, key: Array) -> RKHSFnSamplingPair:
+        key, key_fn, key_disturbance = jax.random.split(key, 3)
+
+        rkhs_fn = self.rkhs_fn.sample(kernel, space, key=key_fn, surface=True)
+        disturbance_fn = self.disturbance_rkhs_fn.sample(kernel, space, key=key, surface=True)
+        rkhs_fn_disturbed = rkhs_fn + disturbance_fn
+
+        return RKHSFnSamplingPair.sample(
+            fn_1=rkhs_fn, fn_2=rkhs_fn_disturbed,
+            noise_1=self.noise_1, noise_2=self.noise_2,
+            space=space,
+            dataset_size=self.dataset_size, n_datasets=n_datasets,
+            key=key
+        )
+
+
+@dataclass(frozen=True)
+class WeightedDisturbedDatasetPairSamplingSpec(_DatasetPairSamplingSpec):
+    relative_disturbance_norm: float
+    tolerance: float
+    weight: float
+
+    @property
+    def disturbance_norm(self) -> float:
+        return self.rkhs_fn.ball_radius * self.relative_disturbance_norm
+
+    def __post_init__(self):
+        super().__post_init__()
+        assert self.relative_disturbance_norm >= 0
+        assert self.tolerance >= 0
+        assert self.weight >= 0
+        assert self.weight <= 1
+
+    def _sample_state_space(self, radius: float, space: SpaceSpec, n_datasets: int, key: Array) -> Array:
+        key_inner, key_outer, key_combined = jax.random.split(key, 3)
+
+        inner_sample = _sample_uniform_ball(
+            radius, dim=space.dim, shape=(n_datasets, self.dataset_size), key=key_inner
+        )
+
+        outer_sample = _sample_uniform_without_ball(
+            space, radius=radius, shape=(n_datasets, self.dataset_size), key=key_outer
+        )
+
+        indicator = jax.random.uniform(key_combined, shape=(n_datasets, self.dataset_size, 1)) < self.weight
+
+        return indicator * inner_sample + (1 - indicator) * outer_sample
+
+    def sample(self, kernel: GaussianKernel, space: SpaceSpec, n_datasets: int, key: Array) -> RKHSFnSamplingPair:
+        center = (space.max_vector - space.min_vector) / 2 + space.min_vector
+
+        disturbance_fn = RKHSFn(
             kernel=kernel,
-            xs_batch=self.data.space.uniform_sample((self.n_functions, self.n_basis_points), key_1),
-            radius=radius,
-            sphere=sphere,
-            key=key_2
+            coefficients=jnp.array([self.disturbance_norm * kernel(center, center)]),
+            points=center[None]
         )
 
-    def sample_function_evaluations(self, kernel: Kernel, fns: RKHSFn, key: jax.Array) -> RKHSFnSampling:
-        @partial(jax.vmap)
-        def batch_sampling_fn(key_: jax.Array) -> jnp.ndarray:
-            return self.data.sample(key_)
+        radius = jnp.sqrt(2 * self.disturbance_norm * kernel.bandwidth * jnp.log(1 / self.tolerance)).item()
 
-        @partial(jax.vmap)
-        def batch_evaluation_fn(fn: RKHSFn, xs_: jnp.ndarray) -> jnp.ndarray:
-            return kernel.evaluate.one_many(fn, xs_)
+        key, key_fn = jax.random.split(key)
+        rkhs_fn = self.rkhs_fn.sample(kernel, space, key=key_fn, surface=True)
+        rkhs_fn_disturbed = rkhs_fn + disturbance_fn
 
-        xs = batch_sampling_fn(jax.random.split(key, self.n_functions))
-        ys = batch_evaluation_fn(fns, xs)
+        key, key_xs_1, key_xs_2 = jax.random.split(key, 3)
+        xs_1 = self._sample_state_space(radius, space, n_datasets, key_xs_1)
+        xs_2 = self._sample_state_space(radius, space, n_datasets, key_xs_2)
 
-        return RKHSFnSampling(xs=xs, ys=ys)
-
-    def sample_noisy_datasets(
-            self,
-            kernel: Kernel, functions: RKHSFn,
-            noise_distribution: GaussianMixtureNoiseConfig,
-            key: jax.Array
-    ) -> RKHSFnSampling:
-        @partial(jax.vmap)
-        def batch_fn(key_: jax.Array) -> RKHSFnSampling:
-            key_data, key_noise = jax.random.split(key_)
-
-            evaluations = self.sample_function_evaluations(kernel, functions, key_data)
-
-            return RKHSFnSampling(
-                xs=evaluations.xs,
-                ys=evaluations.ys + noise_distribution.sample(evaluations.ys.shape, key_noise)
-            )
-
-        keys = jax.random.split(key, self.n_datasets)
-
-        datasets = batch_fn(keys)
-
-        return RKHSFnSampling(
-            xs=datasets.xs.reshape((self.n_functions * self.n_datasets, -1, self.data.space.dim)),
-            ys=datasets.ys.reshape((self.n_functions * self.n_datasets, -1))
+        return RKHSFnSamplingPair.sample_at(
+            fn_1=rkhs_fn, fn_2=rkhs_fn_disturbed,
+            xs_1=xs_1, xs_2=xs_2,
+            noise_1=self.noise_1, noise_2=self.noise_2,
+            key=key
         )
 
 
-@dataclass(frozen=True)
-class SingleFnConfig(BaseConfig, ABC):
-    def sample_rkhs_fn_pair(self, kernel: Kernel, key: jax.Array) -> tuple[RKHSFn, RKHSFn]:
-        fn = self.sample_rkhs_fn(kernel, key)
-        return fn, fn
+@dataclass
+class Config:
+    kernel: VectorKernelSpec
+    space: SpaceSpec
+    datasets: _DatasetPairSamplingSpec
+    test: AnalyticalTest.Spec | BootstrapTest.Spec | HuLeiTest.Spec
+    resolution: int
+    n_repetitions: int
+    seed: int
 
+    @property
+    def rkhs_fn(self) -> RKHSFnSpec:
+        return RKHSFnSpec(n_basis_points=12, ball_radius=1.0)
 
-class DifferentFnConfig(BaseConfig, ABC):
-    def sample_rkhs_fn_pair(self, kernel: Kernel, key: jax.Array) -> tuple[RKHSFn, RKHSFn]:
-        key_1, key_2 = jax.random.split(key)
+    @property
+    def significance_levels(self) -> Array:
+        return jnp.linspace(0, 1, 100).at[0].set(0.001)
 
-        fn_1 = self.sample_rkhs_fn(kernel, key_1)
-        fn_2 = self.sample_rkhs_fn(kernel, key_2)
+    def __post_init__(self):
+        assert self.resolution >= 1
+        assert self.n_repetitions >= 1
 
-        return fn_1, fn_2
-
-
-@dataclass(frozen=True)
-class SingleNoiseConfig(BaseConfig, ABC):
-    noise: GaussianMixtureNoiseConfig  # noise configuration for the dataset
-
-    def sample_dataset_pair(
-            self,
-            kernel: Kernel,
-            fn_1: RKHSFn, fn_2: RKHSFn,
-            key: jax.Array
-    ) -> tuple[RKHSFnSampling, RKHSFnSampling]:
-        key_1, key_2 = jax.random.split(key)
-
-        dataset_1 = self.sample_noisy_datasets(kernel, fn_1, self.noise, key_1)
-        dataset_2 = self.sample_noisy_datasets(kernel, fn_2, self.noise, key_2)
-
-        return dataset_1, dataset_2
-
-    def sub_gaussian_std(self) -> float:
-        return float(self.noise.std.max())
-
-
-@dataclass(frozen=True)
-class DifferentNoiseConfig(BaseConfig, ABC):
-    noise_1: GaussianMixtureNoiseConfig  # noise configuration for the first dataset
-    noise_2: GaussianMixtureNoiseConfig  # noise configuration for the second dataset
-
-    def sample_dataset_pair(
-            self,
-            kernel: Kernel,
-            fn_1: RKHSFn, fn_2: RKHSFn,
-            key: jax.Array
-    ) -> tuple[RKHSFnSampling, RKHSFnSampling]:
-        key_1, key_2 = jax.random.split(key)
-
-        dataset_1 = self.sample_noisy_datasets(kernel, fn_1, self.noise_1, key_1)
-        dataset_2 = self.sample_noisy_datasets(kernel, fn_2, self.noise_2, key_2)
-
-        return dataset_1, dataset_2
-
-    def sub_gaussian_std(self) -> float:
-        return max(
-            float(self.noise_1.std.max()),
-            float(self.noise_2.std.max())
-        )
-
-
-@dataclass(frozen=True)
-class SingleFnSingleNoiseConfig(SingleFnConfig, SingleNoiseConfig):
-    pass
-
-
-@dataclass(frozen=True)
-class SingleFnDifferentNoiseConfig(SingleFnConfig, DifferentNoiseConfig):
-    pass
-
-
-@dataclass(frozen=True)
-class DifferentFnSingleNoiseConfig(DifferentFnConfig, SingleNoiseConfig):
-    pass
-
-
-@dataclass(frozen=True)
-class DifferentFnDifferentNoiseConfig(DifferentFnConfig, DifferentNoiseConfig):
-    pass
-
-
-@dataclass(frozen=True)
-class DisturbedFnSingleNoiseConfig(SingleNoiseConfig):
-    disturbance: float  # disturbance level
-
-    def sample_rkhs_fn_pair(self, kernel: Kernel, key: jax.Array) -> tuple[RKHSFn, RKHSFn]:
-        key_1, key_2 = jax.random.split(key)
-
-        fn_1 = self.sample_rkhs_fn(kernel, key_1)
-        disturbance = self.sample_rkhs_fn(kernel, key_2, radius=self.disturbance, sphere=True)
-
-        # fn_2 = fn_1 + disturbance (batched addition)
-        fn_2 = RKHSFn(
-            coefficients=jnp.concatenate([fn_1.coefficients, disturbance.coefficients], axis=-1),
-            points=jnp.concatenate([fn_1.points, disturbance.points], axis=-2)
-        )
-
-        return fn_1, fn_2
-
-
-class PositiveRate(NamedTuple):
-    uniform: jnp.ndarray
-    local: jnp.ndarray
-    bootstrap_uniform_distribution: jnp.ndarray
-    bootstrap_local_distribution: jnp.ndarray
-
-
-DEFAULT_ARGS = dict(
-    n_functions=10,
-    n_basis_points=20,
-    n_datasets=100,
-    n_evaluation_points=100,
-    rkhs_ball_radius=1.0,
-    resolution_power=100,
-    n_bootstrap_rate=100,
-    seed=0
-)
-
-DEFAULT_MAX_CONFIDENCE_LEVEL = 1
-
-DEFAULT_BOOTSTRAP = BootstrapThresholdConfig(
-    confidence_level=DEFAULT_MAX_CONFIDENCE_LEVEL,
-    n_bootstrap=100,
-    single_beta=False
-)
-
-DEFAULT_SPACE = SpaceConfig(dim=2, min=-1, max=1)
-
-DEFAULT_IID_DATA = IIDDataConfig(
-    space=DEFAULT_SPACE,
-    dataset_size=100
-)
+    def sample_dataset_pairs(self, kernel: Kernel, key: Array) -> RKHSFnSamplingPair:
+        return self.datasets.sample(kernel, self.space, self.n_repetitions, key)

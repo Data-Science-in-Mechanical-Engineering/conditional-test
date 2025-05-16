@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import uuid
 from datetime import datetime
 from functools import update_wrapper
 from pathlib import Path
@@ -64,7 +65,7 @@ class Experiment(Generic[T_Config, T_Result]):
         return location
 
     def __make_folder(self) -> Path:
-        folder = self.__folder() / datetime.now().strftime("%Y-%m-%d %H-%M-%S.%f")
+        folder = self.__folder() / f"{datetime.now().strftime("%Y-%m-%d %H-%M-%S.%f")} {uuid.uuid4().hex[:8]}"
         folder.mkdir(parents=True, exist_ok=False)
         return folder
 
