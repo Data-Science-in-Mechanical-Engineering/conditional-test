@@ -129,7 +129,7 @@ class Experiment(ABC):
 
 @dataclass(frozen=True)
 class GlobalDisturbanceExperiment(Experiment):
-    test_name: Literal["bootstrap", "hu-lei__gt", "hu-lei__lr", "hu-lei__hg"]
+    test_name: Literal["bootstrap", "hu-lei__gt", "hu-lei__hg"]
     relative_norm: float
 
     @property
@@ -162,12 +162,6 @@ class GlobalDisturbanceExperiment(Experiment):
             return BootstrapTest.Spec(n_bootstrap=N_BOOTSTRAP)
         elif self.test_name == "hu-lei__gt":
             return HuLeiTest.SpecGroundTruthDensity()
-        elif self.test_name == "hu-lei__lr":
-            return HuLeiTest.SpecLogisticRegression(
-                k_fold_cv=10,
-                regularization_grid=[0.001, 0.01, 0.1, 1.0, 10, 100],
-                p_train=0.5
-            )
         elif self.test_name == "hu-lei__hg":
             return HuLeiTest.SpecHomoscedasticGaussian(
                 kernel=self.kernel,
@@ -224,7 +218,7 @@ class GlobalDisturbanceExperiment(Experiment):
 
 @dataclass(frozen=True)
 class LocalDisturbanceExperiment(Experiment):
-    test_name: Literal["bootstrap", "hu-lei__gt", "hu-lei__lr", "hu-lei__hg"]
+    test_name: Literal["bootstrap", "hu-lei__gt", "hu-lei__hg"]
     relative_norm: float
     relative_norm: float
     weight: float
@@ -264,12 +258,6 @@ class LocalDisturbanceExperiment(Experiment):
             return BootstrapTest.Spec(n_bootstrap=N_BOOTSTRAP)
         elif self.test_name == "hu-lei__gt":
             return HuLeiTest.SpecGroundTruthDensity()
-        elif self.test_name == "hu-lei__lr":
-            return HuLeiTest.SpecLogisticRegression(
-                k_fold_cv=10,
-                regularization_grid=[0.001, 0.01, 0.1, 1.0, 10, 100],
-                p_train=0.5
-            )
         elif self.test_name == "hu-lei__hg":
             return HuLeiTest.SpecHomoscedasticGaussian(
                 kernel=self.kernel,
