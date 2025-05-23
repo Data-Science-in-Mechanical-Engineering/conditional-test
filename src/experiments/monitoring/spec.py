@@ -171,6 +171,12 @@ class MultipleResult:
             for run in self.runs
         ]).max(axis=-1)
 
+    def reference_mean_std(self) -> Array:
+        return jnp.stack([
+            run.posterior_std_reference
+            for run in self.runs
+        ]).mean(axis=-1)
+
 
 DEFAULT_ARGS = dict(
     n_repetitions=100,

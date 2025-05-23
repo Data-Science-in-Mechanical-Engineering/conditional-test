@@ -7,6 +7,7 @@ import seaborn as sns
 from jax import Array
 from matplotlib.lines import Line2D
 from matplotlib.patches import FancyBboxPatch
+from matplotlib.ticker import FormatStrFormatter, MultipleLocator
 
 from src.experiments.monitoring.__main__ import experiment
 from src.experiments.monitoring.spec import Config, MultipleResult
@@ -14,7 +15,7 @@ from src.expyro.experiment import Run
 from src.figures.util import make_color_palette, make_line_style_palette, MulticolorPatch, MulticolorPatchHandler
 from src.util import set_plot_style, FIGURE_WIDTH_COLUMN, TEXT_FONT_SIZE, COLOR_GRID, DIR_FIGURES
 
-FIGURE_HEIGHT = 2.5
+FIGURE_HEIGHT = 2.75
 
 DIMENSION_DISTURBANCE = 0.1
 DISTURBANCE_DIMENSION = 16
@@ -40,21 +41,20 @@ class Interval(NamedTuple):
             statistic: Callable[[Run[Config, MultipleResult]], Array]
     ) -> Self:
         significance_level = extract_shared_parameter(runs, lambda config: config.test.significance_level)
-        t_change = extract_shared_parameter(runs, lambda config: config.t_change)
 
         # for every random function: for each dataset: for each time step: the statistic at that time step
         # shape: (n_functions, n_repetitions, n_timesteps)
-        max_ratios = jnp.stack([statistic(run) for run in runs])
+        statistics = jnp.stack([statistic(run) for run in runs])
 
         # take the mean and confidence interval over all repetitions
-        mean_max_ratios = max_ratios.mean(axis=(0, 1))
-        lo_max_ratios = jnp.quantile(max_ratios, q=significance_level, axis=(0, 1))
-        hi_max_ratios = jnp.quantile(max_ratios, q=1 - significance_level, axis=(0, 1))
+        mean_statistic = statistics.mean(axis=(0, 1))
+        lo_statistic = jnp.quantile(statistics, q=significance_level, axis=(0, 1))
+        hi_statistic = jnp.quantile(statistics, q=1 - significance_level, axis=(0, 1))
 
         return cls(
-            mean=mean_max_ratios,
-            lo=lo_max_ratios,
-            hi=hi_max_ratios
+            mean=mean_statistic,
+            lo=lo_statistic,
+            hi=hi_statistic
         )
 
     def __len__(self) -> int:
@@ -111,12 +111,13 @@ def plot[T: Hashable](
         line_width: float,
         ci: bool,
         ax_ratio: plt.Axes,
+        ax_std: plt.Axes
 ):
     all_runs = [run for runs in run_groups.values() for run in runs]
     t_change = extract_shared_parameter(all_runs, lambda config: config.t_change)
     t_adapted = extract_shared_parameter(all_runs, lambda config: config.t_adapted)
 
-    def _plot(ax: plt.Axes, statistic: Callable[[Run[Config, MultipleResult]], Array]):
+    def _plot(ax_: plt.Axes, statistic: Callable[[Run[Config, MultipleResult]], Array], ci_: bool):
         for dimension, runs in run_groups.items():
             interval = Interval.from_runs(runs, statistic)
 
@@ -126,36 +127,55 @@ def plot[T: Hashable](
                 x=time, y=interval.mean,
                 color=colors[dimension], linestyle=line_styles[dimension], linewidth=line_width,
                 zorder=10,
-                ax=ax
+                ax=ax_
             )
 
-            if ci:
-                ax.fill_between(
+            if ci_:
+                ax_.fill_between(
                     x=time, y1=interval.lo, y2=interval.hi,
                     color=colors[dimension], alpha=0.1, linewidth=0,
                 )
 
-        ax.axvline(x=t_change, color=COLOR_GRID, linestyle="dotted", linewidth=0.5, zorder=9)
-        ax.axvline(x=t_adapted, color=COLOR_GRID, linestyle="dotted", linewidth=0.5, zorder=9)
-        ax.axhline(y=1, color=COLOR_GRID, linestyle="dotted", linewidth=0.5, zorder=9)
+        ax_.axvline(x=t_change, color=COLOR_GRID, linestyle="dotted", linewidth=0.5, zorder=9)
+        ax_.axvline(x=t_adapted, color=COLOR_GRID, linestyle="dotted", linewidth=0.5, zorder=9)
+        ax_.axhline(y=1, color=COLOR_GRID, linestyle="dotted", linewidth=0.5, zorder=9)
 
-        ax.tick_params(which="both", direction="in", top=True, right=True, bottom=True, left=True)
-        ax.minorticks_on()
+        ax_.tick_params(which="both", direction="in", top=True, right=True, bottom=True, left=True)
+        ax_.minorticks_on()
 
-        ax.set_xmargin(0)
+        ax_.set_xmargin(0)
 
-    _plot(ax_ratio, lambda run: run.result.max_ratios())
+    def max_ratio(run: Run[Config, MultipleResult]) -> Array:
+        return run.result.max_ratios()
 
-    draw_box(t_adapted - 150, 3.50, 75, 0.85, t_change, "Change occurs", ax_ratio)
-    draw_box(t_adapted - 150, 2.00, 75, 1.40, t_adapted, "Window done\nadapting", ax_ratio)
+    def normalized_mean_reference_std(run: Run[Config, MultipleResult]) -> Array:
+        mean_reference_std = run.result.reference_mean_std()
+        return mean_reference_std / mean_reference_std[:, [0]]
 
-    ax_ratio.set_xlabel(r"Time")
+    _plot(ax_ratio, max_ratio, ci)
+    _plot(ax_std, normalized_mean_reference_std, False)
+
+    draw_box(t_adapted - 165, 3.50, 90, 0.85, t_change, "Change occurs", ax_ratio)
+    draw_box(t_adapted - 165, 1.95, 90, 1.50, t_adapted, "Window done\nadapting", ax_ratio)
+
     ax_ratio.set_ylabel(r"Max. ratio")
     ax_ratio.set_ylim(bottom=0, top=5)
 
+    ax_std.set_ylabel(r"Norm. std.")
+    ax_std.set_xlabel(r"Time")
+
+    ax_ratio.yaxis.set_major_locator(MultipleLocator(1))
+
+    for ax in [ax_ratio, ax_std]:
+        ax.yaxis.set_major_formatter(FormatStrFormatter("%.1f"))
+
 
 def main():
-    fig, ax_ratio = plt.subplots(figsize=(FIGURE_WIDTH_COLUMN, FIGURE_HEIGHT))
+    fig, [ax_ratio, ax_std] = plt.subplots(
+        nrows=2, ncols=1, sharex=True, sharey=False,
+        figsize=(FIGURE_WIDTH_COLUMN, FIGURE_HEIGHT),
+        height_ratios=[0.6, 0.4]
+    )
 
     base_path = experiment.directory / experiment.name
 
@@ -177,7 +197,7 @@ def main():
         for disturbance in DISTURBANCES
     }
 
-    colors_dimension = make_color_palette("bright", runs_by_dimension)
+    colors_dimension = make_color_palette("bright", DIMENSIONS)
     colors_disturbance = {disturbance: colors_dimension[DISTURBANCE_DIMENSION] for disturbance in DISTURBANCES}
 
     line_styles_dimension = {dimension: "-" for dimension in DIMENSIONS}
@@ -190,6 +210,7 @@ def main():
         line_width=2,
         ci=True,
         ax_ratio=ax_ratio,
+        ax_std=ax_std
     )
 
     plot(
@@ -199,6 +220,7 @@ def main():
         line_width=1,
         ci=False,
         ax_ratio=ax_ratio,
+        ax_std=ax_std
     )
 
     def handle_dimension(dimension: int) -> Line2D:
@@ -222,38 +244,35 @@ def main():
     dummy_handle = Line2D([], [], color="white", linestyle="-", linewidth=0)
 
     dimension_disturbance_patch = MulticolorPatch(
-        colors=[colors_dimension[dimension] for dimension in runs_by_dimension],
+        colors=[colors_dimension[dimension] for dimension in DIMENSIONS],
         linewidth=2,
         line_style="-",
         round=True
     )
 
-    handles_1: list[Any] = [dimension_disturbance_patch]
-    labels_1 = [fr"$\xi={DIMENSION_DISTURBANCE:.2f}$"]
+    handles: list[Any] = [dimension_disturbance_patch]
+    labels = [fr"$\xi={DIMENSION_DISTURBANCE:.2f}$"]
 
-    handles_1.extend((handle_dimension(dimension) for dimension in runs_by_dimension))
-    labels_1.extend((fr"$d={dimension}$" for dimension in runs_by_dimension))
+    handles.extend((handle_dimension(dimension) for dimension in DIMENSIONS))
+    labels.extend((fr"$d={dimension}$" for dimension in DIMENSIONS))
 
-    handles_2 = [dummy_handle for _ in range(len(runs_by_dimension))]
-    labels_2 = ["" for _ in range(len(runs_by_dimension))]
-    handles_2.append(handle_disturbance(DISTURBANCES[0]))
-    labels_2.append(fr"$\xi={DISTURBANCES[0]:.2f}$")
+    handles.append(dummy_handle)
+    labels.append("")
+    handles.append(handle_disturbance(DISTURBANCES[0]))
+    labels.append(fr"$\xi={DISTURBANCES[0]:.2f}$")
+    handles.append(handle_disturbance(DISTURBANCES[1]))
+    labels.append(fr"$\xi={DISTURBANCES[1]:.2f}$")
 
-    handles_3 = [dummy_handle for _ in range(len(runs_by_dimension))]
-    labels_3 = ["" for _ in range(len(runs_by_dimension))]
-    handles_3.append(handle_disturbance(DISTURBANCES[1]))
-    labels_3.append(fr"$\xi={DISTURBANCES[1]:.2f}$")
-
-    ax_ratio.legend(
-        handles=[handle for collection in zip(handles_1, handles_2, handles_3) for handle in collection],
-        labels=[label for collection in zip(labels_1, labels_2, labels_3) for label in collection],
-        loc="upper left",
-        ncol=5,
+    fig.legend(
+        handles=handles,
+        labels=labels,
+        loc="center right",
+        ncol=1,
         facecolor="white",
-        mode="expand",
         frameon=False,
         fontsize=TEXT_FONT_SIZE,
-        bbox_to_anchor=(0, 1.475, 1, 0),
+        bbox_to_anchor=(1, 0, 0, 1.1),
+        labelspacing=1.1,
         handler_map={
             MulticolorPatch: MulticolorPatchHandler()
         }
@@ -262,10 +281,12 @@ def main():
     ax_ratio.set_xticks(ax_ratio.get_xticks()[1:-1])
 
     fig.tight_layout(pad=0.25)
-    fig.subplots_adjust(top=0.75)
+    fig.subplots_adjust(right=0.8)
 
     DIR_FIGURES.mkdir(parents=True, exist_ok=True)
-    plt.savefig(DIR_FIGURES / "monitoring.pdf", pad_inches=0, dpi=500)
+    plt.savefig(DIR_FIGURES / "monitoring.pdf", dpi=500)
+    plt.savefig(DIR_FIGURES / "monitoring.png", dpi=500)
+    plt.show()
 
 
 if __name__ == "__main__":
