@@ -1,4 +1,4 @@
-# A Conditional Two-sample Test
+# A kernel conditional two-sample test
 The structure of this project is the following:
 
     .
